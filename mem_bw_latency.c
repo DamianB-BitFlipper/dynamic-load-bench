@@ -571,11 +571,12 @@ static int run_stream_only_trial(const Config *cfg, StreamWorker *streamers,
     SharedState shared;
     StreamThreadArgs *stream_args = NULL;
     pthread_t *stream_threads = NULL;
-    uint64_t start_ns;
-    uint64_t end_ns;
+    uint64_t start_ns = 0;
+    uint64_t end_ns = 0;
     int i;
     int created_stream_threads = 0;
     int failed = 0;
+    int started = 0;
     int mutex_initialized = 0;
     int cond_initialized = 0;
 
@@ -647,6 +648,7 @@ static int run_stream_only_trial(const Config *cfg, StreamWorker *streamers,
         goto join_partial;
     }
     start_ns = monotonic_ns();
+    started = 1;
     shared.start_streamers = 1;
     pthread_cond_broadcast(&shared.cond);
     pthread_mutex_unlock(&shared.mutex);
@@ -668,9 +670,11 @@ join_partial:
             failed = 1;
         }
     }
-    end_ns = monotonic_ns();
+    if (started) {
+        end_ns = monotonic_ns();
+    }
 
-    if (!failed) {
+    if (!failed && started) {
         result->elapsed_ns = end_ns - start_ns;
         result->total_bytes = 0;
         for (i = 0; i < active_streamers; ++i) {
