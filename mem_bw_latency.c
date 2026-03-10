@@ -30,6 +30,11 @@ typedef struct Config {
     int streamer_count;
     int latency_cpu_id;
     int stream_only;
+    int chaser_cpu_explicit;
+    int sweep_explicit;
+    int sweep_start_streamers;
+    int sweep_end_streamers;
+    int sweep_step_streamers;
     uint64_t warmup_ms;
     uint64_t chase_steps;
     uint64_t stream_iterations;
@@ -212,6 +217,76 @@ static uint64_t parse_u64(const char *text, const char *flag) {
     }
 
     return (uint64_t) value;
+}
+
+static int parse_int_arg(const char *text, const char *flag) {
+    uint64_t value = parse_u64(text, flag);
+
+    if (value > (uint64_t) INT32_MAX) {
+        fprintf(stderr, "value for %s is too large: %s\n", flag, text);
+        exit(EXIT_FAILURE);
+    }
+
+    return (int) value;
+}
+
+static void parse_sweep_spec(const char *text, Config *cfg) {
+    char *end = NULL;
+    unsigned long long start;
+    unsigned long long stop;
+    unsigned long long step;
+
+    errno = 0;
+    start = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != ':') {
+        fprintf(stderr, "invalid value for --sweep: %s\n", text);
+        exit(EXIT_FAILURE);
+    }
+
+    text = end + 1;
+    errno = 0;
+    stop = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != ':') {
+        fprintf(stderr, "invalid value for --sweep: %s\n", text);
+        exit(EXIT_FAILURE);
+    }
+
+    text = end + 1;
+    errno = 0;
+    step = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        fprintf(stderr, "invalid value for --sweep: %s\n", text);
+        exit(EXIT_FAILURE);
+    }
+
+    if (start > (unsigned long long) INT32_MAX ||
+        stop > (unsigned long long) INT32_MAX ||
+        step > (unsigned long long) INT32_MAX) {
+        fprintf(stderr, "value for --sweep is too large\n");
+        exit(EXIT_FAILURE);
+    }
+
+    cfg->sweep_start_streamers = (int) start;
+    cfg->sweep_end_streamers = (int) stop;
+    cfg->sweep_step_streamers = (int) step;
+    cfg->sweep_explicit = 1;
+}
+
+static int cpu_id_in_list(const int *cpu_ids, int count, int cpu_id) {
+    int i;
+
+    for (i = 0; i < count; ++i) {
+        if (cpu_ids[i] == cpu_id) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static size_t count_sweep_points(const Config *cfg) {
+    return (size_t) ((cfg->sweep_end_streamers - cfg->sweep_start_streamers)
+                     / cfg->sweep_step_streamers) + 1ull;
 }
 
 static size_t mib_to_bytes(uint64_t mib, const char *flag) {
@@ -477,29 +552,45 @@ static void choose_defaults(Config *cfg) {
 
 static void usage(const char *program_name) {
     fprintf(stderr,
-            "Usage: %s [--stream-only -i iterations] [-w warmup_ms] [-n chase_steps] [-s stream_mib] [-p chase_mib] [-o output_csv]\n"
-            "  The benchmark sweeps streaming threads from 0 to N-1 while the first allowed CPU runs pointer chasing.\n"
+            "Usage: %s [--stream-only -i iterations] [--sweep A:B:C] [--chaser-cpu CPU_ID] [-w warmup_ms] [-n chase_steps] [-s stream_mib] [-p chase_mib] [-o output_csv]\n"
+            "  The benchmark sweeps streaming threads while a selected allowed CPU runs pointer chasing.\n"
             "  --stream-only  run only the streaming kernel on all allowed CPUs\n"
+            "  --sweep        latency-mode streamer counts as start:end:step, inclusive (default: 0:max:1)\n"
+            "  --chaser-cpu   latency-mode pointer-chaser CPU ID from the allowed affinity mask\n"
             "  -i  streaming iterations per CPU in stream-only mode (default: 100)\n"
             "  -w  warmup duration before latency timing (default: 1000)\n"
             "  -n  dependent pointer-chase loads to measure (default: 10000000)\n"
             "  -s  MiB per streaming array, per streaming thread (default: auto)\n"
             "  -p  MiB for the pointer-chase structure (default: auto)\n"
-            "  -o  CSV file written after the full sweep (default: mem_bw_latency_results.csv)\n",
+            "  -o  CSV file written after the full sweep (default: results.csv)\n",
             program_name);
 }
 
 static void parse_args(int argc, char **argv, Config *cfg) {
     int opt;
+    enum {
+        OPT_STREAM_ONLY = 1000,
+        OPT_SWEEP,
+        OPT_CHASER_CPU,
+    };
     static const struct option long_options[] = {
-        {"stream-only", no_argument, NULL, 'm'},
+        {"stream-only", no_argument, NULL, OPT_STREAM_ONLY},
+        {"sweep", required_argument, NULL, OPT_SWEEP},
+        {"chaser-cpu", required_argument, NULL, OPT_CHASER_CPU},
         {0, 0, 0, 0}
     };
 
     while ((opt = getopt_long(argc, argv, "w:n:s:p:o:i:h", long_options, NULL)) != -1) {
         switch (opt) {
-            case 'm':
+            case OPT_STREAM_ONLY:
                 cfg->stream_only = 1;
+                break;
+            case OPT_SWEEP:
+                parse_sweep_spec(optarg, cfg);
+                break;
+            case OPT_CHASER_CPU:
+                cfg->latency_cpu_id = parse_int_arg(optarg, "--chaser-cpu");
+                cfg->chaser_cpu_explicit = 1;
                 break;
             case 'w':
                 cfg->warmup_ms = parse_u64(optarg, "-w");
@@ -540,7 +631,10 @@ static void print_config(const Config *cfg, size_t node_count, const int *cpu_id
         printf("  stream_iterations      : %" PRIu64 "\n", cfg->stream_iterations);
     } else {
         printf("  max_streaming_threads  : %d\n", cfg->streamer_count);
-        printf("  sweep_range            : 0..%d\n", cfg->streamer_count);
+        printf("  sweep_range            : %d:%d:%d\n",
+               cfg->sweep_start_streamers,
+               cfg->sweep_end_streamers,
+               cfg->sweep_step_streamers);
         printf("  latency_cpu            : %d\n", cfg->latency_cpu_id);
         printf("  warmup_ms              : %" PRIu64 "\n", cfg->warmup_ms);
         printf("  chase_steps            : %" PRIu64 "\n", cfg->chase_steps);
@@ -940,6 +1034,7 @@ int main(int argc, char **argv) {
     StreamOnlyResult stream_only_result;
     Node *nodes = NULL;
     int *cpu_ids = NULL;
+    int *streamer_cpu_ids = NULL;
     size_t node_count = 0;
     int i;
     int worker_count;
@@ -951,7 +1046,7 @@ int main(int argc, char **argv) {
     cfg.chase_steps = 10000000ull;
     cfg.stream_iterations = 100ull;
     cfg.scalar = 3.0;
-    cfg.output_path = "mem_bw_latency_results.csv";
+    cfg.output_path = "results.csv";
     if (discover_allowed_cpus(&cpu_ids, &cfg.cpu_count) != 0) {
         return EXIT_FAILURE;
     }
@@ -962,6 +1057,9 @@ int main(int argc, char **argv) {
 
     cfg.streamer_count = cfg.cpu_count - 1;
     cfg.latency_cpu_id = cpu_ids[0];
+    cfg.sweep_start_streamers = 0;
+    cfg.sweep_end_streamers = cfg.streamer_count;
+    cfg.sweep_step_streamers = 1;
     parse_args(argc, argv, &cfg);
     choose_defaults(&cfg);
 
@@ -979,9 +1077,34 @@ int main(int argc, char **argv) {
         fprintf(stderr, "stream-only mode requires -i to be at least 1\n");
         return EXIT_FAILURE;
     }
+    if (cfg.stream_only && cfg.sweep_explicit) {
+        fprintf(stderr, "--sweep cannot be used with --stream-only\n");
+        return EXIT_FAILURE;
+    }
+    if (cfg.stream_only && cfg.chaser_cpu_explicit) {
+        fprintf(stderr, "--chaser-cpu cannot be used with --stream-only\n");
+        return EXIT_FAILURE;
+    }
     if (!cfg.stream_only && cfg.chase_bytes < sizeof(Node) * 1024ull) {
         fprintf(stderr, "pointer-chase size must be at least %zu bytes\n",
                 (size_t) (sizeof(Node) * 1024ull));
+        return EXIT_FAILURE;
+    }
+    if (!cfg.stream_only && !cpu_id_in_list(cpu_ids, cfg.cpu_count, cfg.latency_cpu_id)) {
+        fprintf(stderr, "--chaser-cpu %d is not in the allowed CPU mask\n", cfg.latency_cpu_id);
+        return EXIT_FAILURE;
+    }
+    if (!cfg.stream_only &&
+        (cfg.sweep_start_streamers < 0 ||
+         cfg.sweep_end_streamers < cfg.sweep_start_streamers ||
+         cfg.sweep_step_streamers <= 0 ||
+         cfg.sweep_end_streamers > cfg.streamer_count)) {
+        fprintf(stderr,
+                "invalid --sweep range %d:%d:%d; expected 0 <= start <= end <= %d and step >= 1\n",
+                cfg.sweep_start_streamers,
+                cfg.sweep_end_streamers,
+                cfg.sweep_step_streamers,
+                cfg.streamer_count);
         return EXIT_FAILURE;
     }
 
@@ -995,12 +1118,28 @@ int main(int argc, char **argv) {
     }
     cfg.stream_array_bytes = (cfg.stream_array_bytes / sizeof(double)) * sizeof(double);
 
+    if (!cfg.stream_only) {
+        streamer_cpu_ids = malloc((size_t) cfg.streamer_count * sizeof(*streamer_cpu_ids));
+        if (streamer_cpu_ids == NULL) {
+            perror("malloc");
+            failed = 1;
+            goto cleanup;
+        }
+
+        for (i = 0, worker_count = 0; i < cfg.cpu_count; ++i) {
+            if (cpu_ids[i] != cfg.latency_cpu_id) {
+                streamer_cpu_ids[worker_count] = cpu_ids[i];
+                worker_count += 1;
+            }
+        }
+    }
+
     print_config(&cfg, node_count, cpu_ids);
 
     worker_count = cfg.stream_only ? cfg.cpu_count : cfg.streamer_count;
 
     if (!cfg.stream_only) {
-        result_count = (size_t) cfg.streamer_count + 1ull;
+        result_count = count_sweep_points(&cfg);
         results = calloc(result_count, sizeof(*results));
         if (results == NULL) {
             perror("calloc");
@@ -1025,7 +1164,7 @@ int main(int argc, char **argv) {
         StreamWorker *worker = &streamers[i];
 
         worker->thread_index = i;
-        worker->cpu_id = cfg.stream_only ? cpu_ids[i] : cpu_ids[i + 1];
+        worker->cpu_id = cfg.stream_only ? cpu_ids[i] : streamer_cpu_ids[i];
         worker->element_count = cfg.stream_array_bytes / sizeof(double);
         worker->a = aligned_alloc_or_die(64, cfg.stream_array_bytes);
         worker->b = aligned_alloc_or_die(64, cfg.stream_array_bytes);
@@ -1054,8 +1193,10 @@ int main(int argc, char **argv) {
     } else {
         printf("Sweep results\n");
         printf("  streamers total_GiB_per_sec ns_per_load final_index\n");
-        for (i = 0; i <= cfg.streamer_count; ++i) {
-            if (run_trial(&cfg, streamers, nodes, i, &results[i]) != 0) {
+        for (i = 0, worker_count = cfg.sweep_start_streamers;
+             worker_count <= cfg.sweep_end_streamers;
+             worker_count += cfg.sweep_step_streamers, ++i) {
+            if (run_trial(&cfg, streamers, nodes, worker_count, &results[i]) != 0) {
                 failed = 1;
                 break;
             }
@@ -1078,7 +1219,9 @@ int main(int argc, char **argv) {
 
 cleanup:
     if (streamers != NULL) {
-        for (i = 0; i < worker_count; ++i) {
+        int cleanup_worker_count = cfg.stream_only ? cfg.cpu_count : cfg.streamer_count;
+
+        for (i = 0; i < cleanup_worker_count; ++i) {
             free(streamers[i].a);
             free(streamers[i].b);
             free(streamers[i].c);
@@ -1087,6 +1230,7 @@ cleanup:
 
     free(nodes);
     free(results);
+    free(streamer_cpu_ids);
     free(streamers);
     free(cpu_ids);
     return failed ? EXIT_FAILURE : EXIT_SUCCESS;
