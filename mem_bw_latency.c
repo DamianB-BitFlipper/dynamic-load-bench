@@ -28,6 +28,7 @@ _Static_assert(sizeof(Node) == 64, "Node must occupy one cache line");
 typedef struct Config {
     int cpu_count;
     int streamer_count;
+    int latency_cpu_id;
     int stream_only;
     uint64_t warmup_ms;
     uint64_t chase_steps;
@@ -126,6 +127,63 @@ static int pin_thread_to_cpu(int cpu_id) {
     CPU_SET(cpu_id, &set);
 
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
+static void report_affinity_error(int cpu_id, int rc) {
+    fprintf(stderr, "pthread_setaffinity_np(cpu=%d) failed: %s\n",
+            cpu_id,
+            strerror(rc));
+}
+
+static int discover_allowed_cpus(int **cpu_ids_out, int *cpu_count_out) {
+    cpu_set_t set;
+    int *cpu_ids;
+    int count = 0;
+    int cpu;
+
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+        perror("sched_getaffinity");
+        return -1;
+    }
+
+    for (cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) {
+            count += 1;
+        }
+    }
+
+    if (count == 0) {
+        fprintf(stderr, "no allowed CPUs found in the current affinity mask\n");
+        return -1;
+    }
+
+    cpu_ids = malloc((size_t) count * sizeof(*cpu_ids));
+    if (cpu_ids == NULL) {
+        perror("malloc");
+        return -1;
+    }
+
+    count = 0;
+    for (cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) {
+            cpu_ids[count] = cpu;
+            count += 1;
+        }
+    }
+
+    *cpu_ids_out = cpu_ids;
+    *cpu_count_out = count;
+    return 0;
+}
+
+static void print_cpu_list(const int *cpu_ids, int count) {
+    int i;
+
+    for (i = 0; i < count; ++i) {
+        printf("%s%d", i == 0 ? "" : ",", cpu_ids[i]);
+    }
+    printf("\n");
 }
 
 static void *aligned_alloc_or_die(size_t alignment, size_t bytes) {
@@ -255,11 +313,13 @@ static void *stream_thread_main(void *opaque) {
     uint64_t end_ns;
     uint64_t iteration;
     size_t i;
+    int rc;
     double checksum = 0.0;
     double scalar = shared->scalar;
 
-    if (pin_thread_to_cpu(worker->cpu_id) != 0) {
-        perror("pthread_setaffinity_np");
+    rc = pin_thread_to_cpu(worker->cpu_id);
+    if (rc != 0) {
+        report_affinity_error(worker->cpu_id, rc);
         pthread_mutex_lock(&shared->mutex);
         shared->ready_threads += 1;
         atomic_store_explicit(&shared->abort_run, 1, memory_order_release);
@@ -289,6 +349,13 @@ static void *stream_thread_main(void *opaque) {
 
             checksum += worker->a[(size_t) worker->thread_index % worker->element_count];
             worker->bytes_moved += (uint64_t) worker->element_count * 3ull * sizeof(double);
+            if (worker->thread_index == 0 &&
+                (((iteration + 1) % 10ull) == 0 || (iteration + 1) == shared->stream_iterations)) {
+                printf("stream-only iteration %" PRIu64 "/%" PRIu64 "\n",
+                       iteration + 1,
+                       shared->stream_iterations);
+                fflush(stdout);
+            }
         }
     } else {
         while (atomic_load_explicit(&shared->stop_streamers, memory_order_relaxed) == 0) {
@@ -313,9 +380,11 @@ static void *latency_thread_main(void *opaque) {
     LatencyWorker *worker = args->worker;
     uint64_t start_ns;
     uint64_t end_ns;
+    int rc;
 
-    if (pin_thread_to_cpu(worker->cpu_id) != 0) {
-        perror("pthread_setaffinity_np");
+    rc = pin_thread_to_cpu(worker->cpu_id);
+    if (rc != 0) {
+        report_affinity_error(worker->cpu_id, rc);
         pthread_mutex_lock(&shared->mutex);
         shared->ready_threads += 1;
         atomic_store_explicit(&shared->abort_run, 1, memory_order_release);
@@ -409,8 +478,8 @@ static void choose_defaults(Config *cfg) {
 static void usage(const char *program_name) {
     fprintf(stderr,
             "Usage: %s [--stream-only -i iterations] [-w warmup_ms] [-n chase_steps] [-s stream_mib] [-p chase_mib] [-o output_csv]\n"
-            "  The benchmark sweeps streaming threads from 0 to N-1 while CPU 0 runs pointer chasing.\n"
-            "  --stream-only  run only the streaming kernel on all CPUs\n"
+            "  The benchmark sweeps streaming threads from 0 to N-1 while the first allowed CPU runs pointer chasing.\n"
+            "  --stream-only  run only the streaming kernel on all allowed CPUs\n"
             "  -i  streaming iterations per CPU in stream-only mode (default: 100)\n"
             "  -w  warmup duration before latency timing (default: 1000)\n"
             "  -n  dependent pointer-chase loads to measure (default: 10000000)\n"
@@ -460,17 +529,19 @@ static void parse_args(int argc, char **argv, Config *cfg) {
     }
 }
 
-static void print_config(const Config *cfg, size_t node_count) {
+static void print_config(const Config *cfg, size_t node_count, const int *cpu_ids) {
     printf("Benchmark configuration\n");
     printf("  mode                   : %s\n", cfg->stream_only ? "stream-only" : "latency-sweep");
-    printf("  online_cpus            : %d\n", cfg->cpu_count);
+    printf("  allowed_cpu_count      : %d\n", cfg->cpu_count);
+    printf("  allowed_cpu_ids        : ");
+    print_cpu_list(cpu_ids, cfg->cpu_count);
     if (cfg->stream_only) {
         printf("  streaming_threads      : %d\n", cfg->cpu_count);
         printf("  stream_iterations      : %" PRIu64 "\n", cfg->stream_iterations);
     } else {
         printf("  max_streaming_threads  : %d\n", cfg->streamer_count);
         printf("  sweep_range            : 0..%d\n", cfg->streamer_count);
-        printf("  latency_cpu            : 0\n");
+        printf("  latency_cpu            : %d\n", cfg->latency_cpu_id);
         printf("  warmup_ms              : %" PRIu64 "\n", cfg->warmup_ms);
         printf("  chase_steps            : %" PRIu64 "\n", cfg->chase_steps);
     }
@@ -725,7 +796,7 @@ static int run_trial(const Config *cfg, StreamWorker *streamers, const Node *nod
         reset_stream_worker_metrics(&streamers[i]);
     }
 
-    latency_worker.cpu_id = 0;
+    latency_worker.cpu_id = cfg->latency_cpu_id;
     latency_worker.nodes = nodes;
     latency_worker.start_index = 0;
     latency_worker.steps = cfg->chase_steps;
@@ -868,10 +939,10 @@ int main(int argc, char **argv) {
     StreamWorker *streamers = NULL;
     StreamOnlyResult stream_only_result;
     Node *nodes = NULL;
+    int *cpu_ids = NULL;
     size_t node_count = 0;
     int i;
     int worker_count;
-    int cpu_base;
     size_t result_count = 0;
     int failed = 0;
 
@@ -881,18 +952,22 @@ int main(int argc, char **argv) {
     cfg.stream_iterations = 100ull;
     cfg.scalar = 3.0;
     cfg.output_path = "mem_bw_latency_results.csv";
-    cfg.cpu_count = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    if (discover_allowed_cpus(&cpu_ids, &cfg.cpu_count) != 0) {
+        return EXIT_FAILURE;
+    }
     if (cfg.cpu_count < 1) {
-        fprintf(stderr, "need at least 1 online CPU; found %d\n", cfg.cpu_count);
+        fprintf(stderr, "need at least 1 allowed CPU; found %d\n", cfg.cpu_count);
         return EXIT_FAILURE;
     }
 
     cfg.streamer_count = cfg.cpu_count - 1;
+    cfg.latency_cpu_id = cpu_ids[0];
     parse_args(argc, argv, &cfg);
     choose_defaults(&cfg);
 
     if (!cfg.stream_only && cfg.cpu_count < 2) {
-        fprintf(stderr, "latency sweep mode requires at least 2 online CPUs; found %d\n", cfg.cpu_count);
+        fprintf(stderr, "latency sweep mode requires at least 2 allowed CPUs; found %d\n", cfg.cpu_count);
+        free(cpu_ids);
         return EXIT_FAILURE;
     }
 
@@ -920,10 +995,9 @@ int main(int argc, char **argv) {
     }
     cfg.stream_array_bytes = (cfg.stream_array_bytes / sizeof(double)) * sizeof(double);
 
-    print_config(&cfg, node_count);
+    print_config(&cfg, node_count, cpu_ids);
 
     worker_count = cfg.stream_only ? cfg.cpu_count : cfg.streamer_count;
-    cpu_base = cfg.stream_only ? 0 : 1;
 
     if (!cfg.stream_only) {
         result_count = (size_t) cfg.streamer_count + 1ull;
@@ -951,7 +1025,7 @@ int main(int argc, char **argv) {
         StreamWorker *worker = &streamers[i];
 
         worker->thread_index = i;
-        worker->cpu_id = cpu_base + i;
+        worker->cpu_id = cfg.stream_only ? cpu_ids[i] : cpu_ids[i + 1];
         worker->element_count = cfg.stream_array_bytes / sizeof(double);
         worker->a = aligned_alloc_or_die(64, cfg.stream_array_bytes);
         worker->b = aligned_alloc_or_die(64, cfg.stream_array_bytes);
@@ -1014,6 +1088,7 @@ cleanup:
     free(nodes);
     free(results);
     free(streamers);
+    free(cpu_ids);
     return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
