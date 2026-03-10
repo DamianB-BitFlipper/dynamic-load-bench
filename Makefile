@@ -1,4 +1,4 @@
-CC ?= cc
+CC := gcc
 CFLAGS ?= -std=c11 -O3 -Wall -Wextra -pedantic
 LDFLAGS ?=
 LDLIBS ?= -pthread
