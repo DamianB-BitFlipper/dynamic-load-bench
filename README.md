@@ -47,6 +47,7 @@ Show usage:
 - `--stream-only` - run only the streaming kernel on all CPUs allowed by the current affinity mask
 - `--sweep <start:end:step>` - latency-mode streamer counts to test, inclusive; defaults to `0:max:1`
 - `--chaser-cpu <cpu_id>` - latency-mode pointer-chaser CPU ID from the allowed affinity mask
+- `--chase-stride <nodes>` - latency-mode pointer-chase stride in 64-byte nodes; defaults to random
 - `-i <iterations>` - streaming iterations per CPU in stream-only mode
 - `-w <ms>` - warmup time before pointer-chase timing in latency-sweep mode
 - `-n <steps>` - number of dependent pointer-chase loads in latency-sweep mode
@@ -60,6 +61,7 @@ Examples:
 ./mem_bw_latency -w 2000 -n 20000000 -s 32 -p 128 -o sweep.csv
 ./mem_bw_latency --sweep 0:0:1 -o no_load.csv
 ./mem_bw_latency --sweep 0:8:2 --chaser-cpu 4 -o partial_sweep.csv
+./mem_bw_latency --sweep 0:4:1 --chase-stride 16 -o stride.csv
 ./mem_bw_latency --stream-only -i 5000 -s 64 -o stream_only.csv
 ```
 
@@ -82,6 +84,7 @@ Both modes write CSV results at the end. The default output file is `results.csv
 - The benchmark is intended for Linux systems with pthread CPU affinity support.
 - CPU selection follows the process affinity mask from `sched_getaffinity()`, so sparse masks like `0,2,4,6` work correctly.
 - In latency mode, `--sweep 0:0:1` measures pointer chasing with no streaming load.
+- In latency mode, omitting `--chase-stride` keeps the existing random pointer-chase cycle.
 - On non-Linux platforms, the program builds but exits with a message explaining that Linux affinity APIs are required.
 - `stream_array_bytes` is per array, per thread; each streaming worker uses three arrays.
 - Use `make clean` to remove the compiled binary.

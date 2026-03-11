@@ -31,10 +31,12 @@ typedef struct Config {
     int latency_cpu_id;
     int stream_only;
     int chaser_cpu_explicit;
+    int chase_stride_explicit;
     int sweep_explicit;
     int sweep_start_streamers;
     int sweep_end_streamers;
     int sweep_step_streamers;
+    uint64_t chase_stride_nodes;
     uint64_t warmup_ms;
     uint64_t chase_steps;
     uint64_t stream_iterations;
@@ -289,6 +291,16 @@ static size_t count_sweep_points(const Config *cfg) {
                      / cfg->sweep_step_streamers) + 1ull;
 }
 
+static size_t gcd_size_t(size_t a, size_t b) {
+    while (b != 0) {
+        size_t tmp = a % b;
+        a = b;
+        b = tmp;
+    }
+
+    return a;
+}
+
 static size_t mib_to_bytes(uint64_t mib, const char *flag) {
     if (mib == 0 || mib > (UINT64_MAX / (1024ull * 1024ull))) {
         fprintf(stderr, "invalid MiB value for %s: %" PRIu64 "\n", flag, mib);
@@ -347,6 +359,49 @@ static void build_random_cycle(Node *nodes, size_t node_count) {
 
     for (i = 0; i + 1 < node_count; ++i) {
         nodes[order[i]].next = order[i + 1];
+    }
+    nodes[order[node_count - 1]].next = order[0];
+
+    free(order);
+}
+
+static void build_stride_cycle(Node *nodes, size_t node_count, size_t stride) {
+    uint32_t *order;
+    size_t cycle_count;
+    size_t order_index = 0;
+    size_t cycle_start;
+
+    stride %= node_count;
+    if (stride == 0) {
+        fprintf(stderr, "--chase-stride must not be a multiple of chase_nodes\n");
+        exit(EXIT_FAILURE);
+    }
+
+    order = malloc(node_count * sizeof(*order));
+    if (order == NULL) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+
+    cycle_count = gcd_size_t(node_count, stride);
+    for (cycle_start = 0; cycle_start < cycle_count; ++cycle_start) {
+        size_t index = cycle_start;
+
+        do {
+            order[order_index] = (uint32_t) index;
+            order_index += 1;
+            index = (index + stride) % node_count;
+        } while (index != cycle_start);
+    }
+
+    if (order_index != node_count) {
+        fprintf(stderr, "failed to build stride cycle for chase pattern\n");
+        free(order);
+        exit(EXIT_FAILURE);
+    }
+
+    for (cycle_start = 0; cycle_start + 1 < node_count; ++cycle_start) {
+        nodes[order[cycle_start]].next = order[cycle_start + 1];
     }
     nodes[order[node_count - 1]].next = order[0];
 
@@ -552,11 +607,12 @@ static void choose_defaults(Config *cfg) {
 
 static void usage(const char *program_name) {
     fprintf(stderr,
-            "Usage: %s [--stream-only -i iterations] [--sweep A:B:C] [--chaser-cpu CPU_ID] [-w warmup_ms] [-n chase_steps] [-s stream_mib] [-p chase_mib] [-o output_csv]\n"
+            "Usage: %s [--stream-only -i iterations] [--sweep A:B:C] [--chaser-cpu CPU_ID] [--chase-stride NODES] [-w warmup_ms] [-n chase_steps] [-s stream_mib] [-p chase_mib] [-o output_csv]\n"
             "  The benchmark sweeps streaming threads while a selected allowed CPU runs pointer chasing.\n"
             "  --stream-only  run only the streaming kernel on all allowed CPUs\n"
             "  --sweep        latency-mode streamer counts as start:end:step, inclusive (default: 0:max:1)\n"
             "  --chaser-cpu   latency-mode pointer-chaser CPU ID from the allowed affinity mask\n"
+            "  --chase-stride latency-mode pointer-chase stride in 64-byte nodes; default is random\n"
             "  -i  streaming iterations per CPU in stream-only mode (default: 100)\n"
             "  -w  warmup duration before latency timing (default: 1000)\n"
             "  -n  dependent pointer-chase loads to measure (default: 10000000)\n"
@@ -572,11 +628,13 @@ static void parse_args(int argc, char **argv, Config *cfg) {
         OPT_STREAM_ONLY = 1000,
         OPT_SWEEP,
         OPT_CHASER_CPU,
+        OPT_CHASE_STRIDE,
     };
     static const struct option long_options[] = {
         {"stream-only", no_argument, NULL, OPT_STREAM_ONLY},
         {"sweep", required_argument, NULL, OPT_SWEEP},
         {"chaser-cpu", required_argument, NULL, OPT_CHASER_CPU},
+        {"chase-stride", required_argument, NULL, OPT_CHASE_STRIDE},
         {0, 0, 0, 0}
     };
 
@@ -591,6 +649,10 @@ static void parse_args(int argc, char **argv, Config *cfg) {
             case OPT_CHASER_CPU:
                 cfg->latency_cpu_id = parse_int_arg(optarg, "--chaser-cpu");
                 cfg->chaser_cpu_explicit = 1;
+                break;
+            case OPT_CHASE_STRIDE:
+                cfg->chase_stride_nodes = parse_u64(optarg, "--chase-stride");
+                cfg->chase_stride_explicit = 1;
                 break;
             case 'w':
                 cfg->warmup_ms = parse_u64(optarg, "-w");
@@ -636,6 +698,11 @@ static void print_config(const Config *cfg, size_t node_count, const int *cpu_id
                cfg->sweep_end_streamers,
                cfg->sweep_step_streamers);
         printf("  latency_cpu            : %d\n", cfg->latency_cpu_id);
+        printf("  chase_pattern          : %s\n",
+               cfg->chase_stride_explicit ? "stride" : "random");
+        if (cfg->chase_stride_explicit) {
+            printf("  chase_stride_nodes     : %" PRIu64 "\n", cfg->chase_stride_nodes);
+        }
         printf("  warmup_ms              : %" PRIu64 "\n", cfg->warmup_ms);
         printf("  chase_steps            : %" PRIu64 "\n", cfg->chase_steps);
     }
@@ -662,7 +729,7 @@ static int write_results_csv(const char *path, const Config *cfg, const TrialRes
     }
 
     if (fprintf(fp,
-                "streamers,total_gib_per_sec,ns_per_load,final_index,warmup_ms,chase_steps,stream_array_bytes,chase_bytes\n") < 0) {
+                "streamers,total_gib_per_sec,ns_per_load,final_index,warmup_ms,chase_steps,stream_array_bytes,chase_bytes,chase_pattern,chase_stride_nodes\n") < 0) {
         perror("fprintf");
         fclose(fp);
         return -1;
@@ -670,7 +737,7 @@ static int write_results_csv(const char *path, const Config *cfg, const TrialRes
 
     for (i = 0; i < count; ++i) {
         if (fprintf(fp,
-                    "%d,%.6f,%.6f,%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%zu,%zu\n",
+                    "%d,%.6f,%.6f,%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%zu,%zu,%s,%" PRIu64 "\n",
                     results[i].active_streamers,
                     results[i].total_bandwidth_gib,
                     (double) results[i].latency_ns / (double) cfg->chase_steps,
@@ -678,7 +745,9 @@ static int write_results_csv(const char *path, const Config *cfg, const TrialRes
                     cfg->warmup_ms,
                     cfg->chase_steps,
                     cfg->stream_array_bytes,
-                    cfg->chase_bytes) < 0) {
+                    cfg->chase_bytes,
+                    cfg->chase_stride_explicit ? "stride" : "random",
+                    cfg->chase_stride_explicit ? cfg->chase_stride_nodes : 0ull) < 0) {
             perror("fprintf");
             fclose(fp);
             return -1;
@@ -1081,8 +1150,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--sweep cannot be used with --stream-only\n");
         return EXIT_FAILURE;
     }
+    if (cfg.stream_only && cfg.chase_stride_explicit) {
+        fprintf(stderr, "--chase-stride cannot be used with --stream-only\n");
+        return EXIT_FAILURE;
+    }
     if (cfg.stream_only && cfg.chaser_cpu_explicit) {
         fprintf(stderr, "--chaser-cpu cannot be used with --stream-only\n");
+        return EXIT_FAILURE;
+    }
+    if (!cfg.stream_only && cfg.chase_stride_explicit && cfg.chase_stride_nodes == 0) {
+        fprintf(stderr, "--chase-stride must be at least 1\n");
         return EXIT_FAILURE;
     }
     if (!cfg.stream_only && cfg.chase_bytes < sizeof(Node) * 1024ull) {
@@ -1157,7 +1234,11 @@ int main(int argc, char **argv) {
 
     if (!cfg.stream_only) {
         nodes = aligned_alloc_or_die(64, cfg.chase_bytes);
-        build_random_cycle(nodes, node_count);
+        if (cfg.chase_stride_explicit) {
+            build_stride_cycle(nodes, node_count, (size_t) cfg.chase_stride_nodes);
+        } else {
+            build_random_cycle(nodes, node_count);
+        }
     }
 
     for (i = 0; i < worker_count; ++i) {
