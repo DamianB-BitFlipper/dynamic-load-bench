@@ -747,7 +747,7 @@ static int write_results_csv(const char *path, const Config *cfg, const TrialRes
                     cfg->stream_array_bytes,
                     cfg->chase_bytes,
                     cfg->chase_stride_explicit ? "stride" : "random",
-                    cfg->chase_stride_explicit ? cfg->chase_stride_nodes : 0ull) < 0) {
+                    cfg->chase_stride_explicit ? cfg->chase_stride_nodes : (uint64_t) 0) < 0) {
             perror("fprintf");
             fclose(fp);
             return -1;

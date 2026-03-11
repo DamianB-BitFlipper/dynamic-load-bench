@@ -1,2 +1,3 @@
 mem_bw_latency
+*.o
 *.csv
